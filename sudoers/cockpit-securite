@@ -1,0 +1,4 @@
+# Module Cockpit « Sécurité et tâches » : ce compte peut lancer UNIQUEMENT l'assistant ci-dessous.
+# Il lit fail2ban / timers / certificats / ports et ne sait faire que 3 actions (ban, unban, lancer un timer
+# existant), validées et journalisées (syslog, étiquette cockpit-securite). Il n'est PAS sudoer général.
+admin ALL=(root) NOPASSWD: /usr/local/libexec/cockpit-securite

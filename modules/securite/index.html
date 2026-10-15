@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sécurité et tâches</title>
+    <link rel="stylesheet" href="../studio/studio.css">
+    <link rel="stylesheet" href="securite.css">
+    <script src="../base1/cockpit.js"></script>
+    <script src="../studio/studio.js"></script>
+</head>
+<body>
+    <main class="page">
+        <header class="head">
+            <div class="title">
+                <div class="glyph" id="glyph"></div>
+                <div>
+                    <p class="eyebrow">fail2ban · ban 30 jours · Let's Encrypt</p>
+                    <h1>Sécurité et tâches</h1>
+                    <p class="sub" id="summary">fail2ban, bannissements, recherche d'IP, tâches planifiées, certificats, système</p>
+                </div>
+            </div>
+            <div class="toolbar">
+                <button class="btn" id="refresh" type="button">Actualiser</button>
+            </div>
+        </header>
+
+        <div id="alert" class="alert" role="alert" hidden></div>
+
+        <nav class="tabs" role="tablist" aria-label="Sections">
+            <button class="tab" role="tab" type="button" data-tab="overview" aria-selected="true" aria-controls="p-overview">Vue d'ensemble</button>
+            <button class="tab" role="tab" type="button" data-tab="jails" aria-selected="false" aria-controls="p-jails">Prisons fail2ban <span class="n" id="n-banned" hidden></span></button>
+            <button class="tab" role="tab" type="button" data-tab="history" aria-selected="false" aria-controls="p-history">Historique des bans</button>
+            <button class="tab" role="tab" type="button" data-tab="ip" aria-selected="false" aria-controls="p-ip">Recherche IP</button>
+            <button class="tab" role="tab" type="button" data-tab="tasks" aria-selected="false" aria-controls="p-tasks">Tâches planifiées</button>
+            <button class="tab" role="tab" type="button" data-tab="certs" aria-selected="false" aria-controls="p-certs">Certificats SSL</button>
+            <button class="tab" role="tab" type="button" data-tab="system" aria-selected="false" aria-controls="p-system">Système</button>
+        </nav>
+
+        <section class="panel" id="p-overview" role="tabpanel"></section>
+        <section class="panel" id="p-jails" role="tabpanel" hidden></section>
+        <section class="panel" id="p-history" role="tabpanel" hidden></section>
+        <section class="panel" id="p-ip" role="tabpanel" hidden>
+            <div class="card">
+                <form class="row" id="ip-form" autocomplete="off">
+                    <div class="ipwrap" id="ipwrap">
+                        <input type="text" id="ip-q" placeholder="Adresse IP (IPv4 ou IPv6), ex. 8.8.8.8" spellcheck="false" aria-label="Adresse IP">
+                    </div>
+                    <button class="btn primary" type="submit" id="ip-go">Rechercher</button>
+                </form>
+                <p class="hint">Bans en cours et passés, tentatives relevées par fail2ban, requêtes reçues par nginx, connexions SSH,
+                    géoblocage, listes ipset, DNS inverse et whois (pays, opérateur, contact abus).</p>
+            </div>
+            <div id="ip-out"></div>
+        </section>
+        <section class="panel" id="p-tasks" role="tabpanel" hidden></section>
+        <section class="panel" id="p-certs" role="tabpanel" hidden></section>
+        <section class="panel" id="p-system" role="tabpanel" hidden></section>
+    </main>
+
+    <dialog id="dlg" class="small">
+        <form method="dialog" id="dlg-form">
+            <header class="dlg-head"><h2 id="dlg-title"></h2></header>
+            <div class="dlg-body form" id="dlg-body"></div>
+            <footer class="dlg-foot">
+                <button class="btn" value="cancel" type="submit" formnovalidate>Annuler</button>
+                <button class="btn primary" value="ok" type="submit" id="dlg-ok">Confirmer</button>
+            </footer>
+        </form>
+    </dialog>
+    <div id="tip" class="tip" role="tooltip" hidden></div>
+    <script src="securite.js"></script>
+</body>
+</html>

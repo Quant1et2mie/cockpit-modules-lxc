@@ -1,0 +1,323 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+cockpit-logs : assistant du module Cockpit « Journaux centralisés ».
+
+Appelé UNIQUEMENT via sudo par le module (/usr/share/cockpit/logs), avec une règle sudoers
+limitée à ce seul fichier (/etc/sudoers.d/cockpit-logs). LECTURE SEULE : il ne modifie rien.
+
+Il lit les journaux reçus par le container « logs » (rsyslog central) directement depuis son
+rootfs : /var/lib/lxc/logs/rootfs/var/log/remote/<machine>/<programme>.log
+(+ rotations logrotate <programme>.log-AAAAMMJJ[.gz]) et les rapports quotidiens de _rapports/.
+
+Sécurité :
+  * liste blanche de sous-commandes, arguments validés par expressions régulières ;
+  * chemins résolus (realpath) puis vérifiés sous la racine : un lien symbolique posé dans le
+    container ne permet pas de lire un fichier de l'hôte ;
+  * volume de sortie borné (nombre de lignes, taille lue, longueur de ligne).
+
+Sortie : JSON sur stdout ; en cas d'erreur, message en clair sur stderr et code retour 2.
+"""
+import gzip
+import json
+import os
+import re
+import sys
+from collections import deque
+from datetime import datetime, timedelta, timezone
+
+ROOT = "/var/lib/lxc/logs/rootfs/var/log/remote"
+REPORTS = "_rapports"
+ALERTS = "/var/lib/lxc/logs/rootfs/var/log/alertes.log"
+
+MACHINE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$")
+FILE_RE = re.compile(r"^[A-Za-z0-9_@.-]{1,100}\.log(?:-[0-9]{8})?(?:\.gz)?$")
+REPORT_RE = re.compile(r"^rapport-[0-9]{4}-[0-9]{2}-[0-9]{2}\.txt$")
+LINE_RE = re.compile(r"^(\S+) (\S+) (\S+) ?(.*)$")
+
+MAX_LINES = 5000
+MAX_LINE_LEN = 4000
+MAX_SCAN = 64 * 1024 * 1024       # octets décompressés lus au maximum par requête
+MAX_REPORT = 512 * 1024
+
+
+def fail(msg, code=2):
+    sys.stderr.write(msg + "\n")      # Cockpit le reçoit comme message d'erreur (err: "message")
+    sys.exit(code)
+
+
+def safe_path(*parts):
+    p = os.path.realpath(os.path.join(ROOT, *parts))
+    if not p.startswith(ROOT + os.sep):
+        fail("chemin refusé")
+    return p
+
+
+def check_machine(m):
+    if not MACHINE_RE.match(m or ""):
+        fail("nom de machine invalide")
+    return m
+
+
+def check_file(f):
+    if not FILE_RE.match(f or ""):
+        fail("nom de fichier invalide")
+    return f
+
+
+def open_text(path):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, "r", encoding="utf-8", errors="replace")
+
+
+def parse(line):
+    line = line.rstrip("\n")
+    if len(line) > MAX_LINE_LEN:
+        line = line[:MAX_LINE_LEN] + " …[tronqué]"
+    m = LINE_RE.match(line)
+    if not m:
+        return {"t": "", "h": "", "p": "", "m": line}
+    return {"t": m.group(1), "h": m.group(2), "p": m.group(3), "m": m.group(4)}
+
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def iter_lines(path, start=0):
+    """Lit un fichier (éventuellement compressé) ligne par ligne, avec une borne de volume."""
+    read = 0
+    with open_text(path) as fh:
+        if start and not path.endswith(".gz"):
+            fh.seek(start)
+        for line in fh:
+            read += len(line)
+            if read > MAX_SCAN:
+                break
+            yield line
+
+
+def matcher(text, regex):
+    if not text:
+        return lambda s: True
+    if regex:
+        try:
+            rx = re.compile(text, re.IGNORECASE)
+        except re.error as e:
+            fail("expression régulière invalide : %s" % e)
+        return lambda s: rx.search(s) is not None
+    low = text.lower()
+    return lambda s: low in s.lower()
+
+
+def files_of(machine):
+    d = safe_path(machine)
+    out = []
+    for f in sorted(os.listdir(d)):
+        if not FILE_RE.match(f):
+            continue
+        p = os.path.join(d, f)
+        if os.path.islink(p) or not os.path.isfile(p):
+            continue
+        st = os.stat(p)
+        out.append({"name": f, "size": st.st_size, "mtime": int(st.st_mtime)})
+    return out
+
+
+# ---------------------------------------------------------------- sous-commandes
+def cmd_list(_args):
+    machines = []
+    for m in sorted(os.listdir(ROOT), key=str.lower):
+        p = os.path.join(ROOT, m)
+        if m == REPORTS or not MACHINE_RE.match(m) or os.path.islink(p) or not os.path.isdir(p):
+            continue
+        machines.append({"name": m, "files": files_of(m)})
+    reports = []
+    rd = os.path.join(ROOT, REPORTS)
+    if os.path.isdir(rd):
+        reports = sorted((f for f in os.listdir(rd) if REPORT_RE.match(f)), reverse=True)
+    return {"machines": machines, "reports": reports, "now": datetime.now(timezone.utc).isoformat()}
+
+
+def get_opts(args, spec):
+    """Petit analyseur d'options --clé valeur, liste blanche par sous-commande."""
+    opts = {}
+    i = 0
+    while i < len(args):
+        k = args[i]
+        if not k.startswith("--") or k[2:] not in spec:
+            fail("option inconnue : %s" % k)
+        kind = spec[k[2:]]
+        if kind is bool:
+            opts[k[2:]] = True
+            i += 1
+            continue
+        if i + 1 >= len(args):
+            fail("valeur manquante pour %s" % k)
+        v = args[i + 1]
+        if kind is int:
+            if not re.match(r"^[0-9]{1,9}$", v):
+                fail("valeur numérique invalide pour %s" % k)
+            v = int(v)
+        elif len(v) > 200 or "\0" in v:
+            fail("valeur trop longue pour %s" % k)
+        opts[k[2:]] = v
+        i += 2
+    return opts
+
+
+def cmd_read(args):
+    """read <machine> <fichier> [--lines N] [--grep TXT] [--regex] : dernières lignes correspondantes."""
+    if len(args) < 2:
+        fail("usage : read <machine> <fichier>")
+    machine, fname = check_machine(args[0]), check_file(args[1])
+    o = get_opts(args[2:], {"lines": int, "grep": str, "regex": bool})
+    n = max(1, min(o.get("lines", 500), MAX_LINES))
+    path = safe_path(machine, fname)
+    if not os.path.isfile(path):
+        fail("fichier introuvable")
+    ok = matcher(o.get("grep"), o.get("regex"))
+    buf = deque(maxlen=n)
+    total = 0
+    for line in iter_lines(path):
+        total += 1
+        if ok(line):
+            buf.append(line)
+    size = os.path.getsize(path)
+    return {"lines": [parse(l) for l in buf], "scanned": total,
+            "offset": size if not path.endswith(".gz") else None}
+
+
+def cmd_follow(args):
+    """follow <machine> <fichier> <offset> : lignes ajoutées depuis <offset> (mode direct)."""
+    if len(args) != 3 or not re.match(r"^[0-9]{1,15}$", args[2]):
+        fail("usage : follow <machine> <fichier> <offset>")
+    machine, fname = check_machine(args[0]), check_file(args[1])
+    if fname.endswith(".gz"):
+        fail("pas de suivi en direct sur une archive")
+    path = safe_path(machine, fname)
+    offset = int(args[2])
+    size = os.path.getsize(path)
+    rotated = size < offset          # fichier tourné/tronqué : on repart du début
+    if rotated:
+        offset = 0
+    out = []
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        data = fh.read(min(size - offset, 4 * 1024 * 1024))
+    # ne garder que les lignes complètes
+    cut = data.rfind(b"\n") + 1
+    for raw in data[:cut].splitlines()[-MAX_LINES:]:
+        out.append(parse(raw.decode("utf-8", "replace")))
+    return {"lines": out, "offset": offset + cut, "rotated": rotated}
+
+
+def cmd_search(args):
+    """search --grep TXT [--regex] [--hours H] [--lines N] : recherche dans toutes les machines."""
+    o = get_opts(args, {"grep": str, "regex": bool, "hours": int, "lines": int})
+    n = max(1, min(o.get("lines", 1000), MAX_LINES))
+    since = datetime.now(timezone.utc) - timedelta(hours=max(1, min(o.get("hours", 24), 24 * 90)))
+    ok = matcher(o.get("grep"), o.get("regex"))
+    hits = []
+    for m in cmd_list([])["machines"]:
+        for f in m["files"]:
+            if f["mtime"] < since.timestamp():
+                continue           # rien de récent dans ce fichier
+            for line in iter_lines(safe_path(m["name"], f["name"])):
+                if not ok(line):
+                    continue
+                e = parse(line)
+                ts = parse_ts(e["t"])
+                if ts and ts < since:
+                    continue
+                e["f"] = f["name"]
+                e["h"] = e["h"] or m["name"]
+                hits.append(e)
+    hits.sort(key=lambda e: e["t"])
+    return {"lines": hits[-n:], "total": len(hits)}
+
+
+ERR_RE = re.compile(r"\b(error|erreur|err|fail(ed|ure)?|crit(ical)?|fatal|panic|emerg|alert|denied|refused|"
+                    r"segfault|out of memory|oom|killed process|ban)\b", re.IGNORECASE)
+HTTP_RE = re.compile(r'" ([1-5][0-9]{2}) [0-9-]+ ')
+
+
+def is_error(e):
+    if "access" in e["p"]:
+        m = HTTP_RE.search(e["m"])
+        return bool(m and m.group(1).startswith("5"))
+    return bool(ERR_RE.search(e["m"]))
+
+
+def cmd_stats(args):
+    """stats [--hours H] : volume et erreurs par heure et par machine (fichiers courants)."""
+    o = get_opts(args, {"hours": int})
+    hours = max(1, min(o.get("hours", 24), 24 * 7))
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    start = now - timedelta(hours=hours - 1)
+    buckets = [{"t": (start + timedelta(hours=i)).isoformat(), "n": 0, "err": 0} for i in range(hours)]
+    per = {}
+    for m in cmd_list([])["machines"]:
+        s = per.setdefault(m["name"], {"n": 0, "err": 0, "last": None})
+        for f in m["files"]:
+            if f["name"].endswith(".gz") or f["mtime"] < start.timestamp():
+                continue
+            for line in iter_lines(safe_path(m["name"], f["name"])):
+                e = parse(line)
+                ts = parse_ts(e["t"])
+                if not ts or ts < start:
+                    continue
+                i = int((ts - start).total_seconds() // 3600)
+                if not 0 <= i < hours:
+                    continue
+                err = is_error(e)
+                buckets[i]["n"] += 1
+                s["n"] += 1
+                if err:
+                    buckets[i]["err"] += 1
+                    s["err"] += 1
+                if not s["last"] or e["t"] > s["last"]:
+                    s["last"] = e["t"]
+    return {"hours": buckets, "machines": per}
+
+
+def cmd_report(args):
+    if len(args) != 1 or not REPORT_RE.match(args[0]):
+        fail("nom de rapport invalide")
+    p = safe_path(REPORTS, args[0])
+    with open(p, "r", encoding="utf-8", errors="replace") as fh:
+        return {"text": fh.read(MAX_REPORT)}
+
+
+def cmd_alerts(args):
+    o = get_opts(args, {"lines": int})
+    n = max(1, min(o.get("lines", 200), 2000))
+    real = os.path.realpath(ALERTS)
+    if real != ALERTS or not os.path.isfile(real):
+        return {"lines": []}
+    with open(real, "r", encoding="utf-8", errors="replace") as fh:
+        return {"lines": [l.rstrip("\n")[:MAX_LINE_LEN] for l in deque(fh, maxlen=n)]}
+
+
+COMMANDS = {"list": cmd_list, "read": cmd_read, "follow": cmd_follow, "search": cmd_search,
+            "stats": cmd_stats, "report": cmd_report, "alerts": cmd_alerts}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        fail("sous-commande inconnue (attendu : %s)" % ", ".join(COMMANDS))
+    if not os.path.isdir(ROOT):
+        fail("dossier des journaux introuvable : %s (container « logs » absent ?)" % ROOT)
+    try:
+        res = COMMANDS[sys.argv[1]](sys.argv[2:])
+    except (OSError, EOFError) as e:
+        fail("lecture impossible : %s" % e.strerror if hasattr(e, "strerror") and e.strerror else str(e))
+    sys.stdout.write(json.dumps(res, ensure_ascii=False, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

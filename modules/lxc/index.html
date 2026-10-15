@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Conteneurs LXC</title>
+    <link rel="stylesheet" href="../studio/studio.css">
+    <link rel="stylesheet" href="lxc.css">
+    <script src="../base1/cockpit.js"></script>
+    <script src="../studio/studio.js"></script>
+</head>
+<body>
+    <main class="page">
+        <header class="head">
+            <div class="title">
+                <div class="glyph" id="glyph"></div>
+                <div>
+                    <p class="eyebrow">Hôte · lxcbr0 10.0.3.0/24</p>
+                    <h1>Conteneurs LXC</h1>
+                    <p class="sub" id="summary">Chargement…</p>
+                </div>
+            </div>
+            <div class="toolbar">
+                <label class="switch" title="Actualisation automatique toutes les 5 secondes">
+                    <input type="checkbox" id="auto" checked>
+                    <span class="track"></span>
+                    <span>Auto&nbsp;(5&nbsp;s)</span>
+                </label>
+                <button class="btn" id="refresh" type="button">Actualiser</button>
+                <button class="btn primary" id="new" type="button">Nouveau conteneur</button>
+            </div>
+        </header>
+
+        <div id="alert" class="alert" role="alert" hidden></div>
+
+        <section class="tiles" id="tiles" aria-label="Résumé"></section>
+
+        <section class="card" aria-labelledby="h-list">
+            <div class="card-head">
+                <h2 id="h-list">Conteneurs</h2>
+                <div class="pills" id="filters" role="group" aria-label="Filtrer par état"></div>
+            </div>
+            <div class="filterbar" id="searchbar">
+                <input type="search" id="q" placeholder="Rechercher un nom, une IP, un système…" aria-label="Rechercher un conteneur" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="ct-grid" id="grid" aria-live="polite"></div>
+            <p class="empty" id="none" hidden></p>
+        </section>
+
+        <section class="card" aria-labelledby="h-arch">
+            <div class="card-head"><h2 id="h-arch">Architecture du reverse proxy</h2></div>
+            <div id="arch" class="arch"></div>
+        </section>
+    </main>
+
+    <!-- Détails d'un conteneur -->
+    <dialog id="detail" class="wide" aria-labelledby="d-title">
+        <header class="dlg-head">
+            <h2 id="d-title"></h2>
+            <button class="btn ghost icon" type="button" data-close aria-label="Fermer">✕</button>
+        </header>
+        <nav class="tabs" id="tabs" role="tablist" aria-label="Sections du conteneur"></nav>
+        <div class="dlg-body" id="d-body"></div>
+    </dialog>
+
+    <!-- Création -->
+    <dialog id="create" aria-labelledby="c-title">
+        <form method="dialog" id="c-form" novalidate>
+            <header class="dlg-head">
+                <h2 id="c-title">Nouveau conteneur</h2>
+                <button class="btn ghost icon" type="button" data-close aria-label="Fermer">✕</button>
+            </header>
+            <div class="dlg-body form">
+                <label>Nom
+                    <input id="c-name" autocomplete="off" spellcheck="false" placeholder="ex. planka" maxlength="31">
+                    <small>Minuscules, chiffres et tirets. Suivez le schéma : un conteneur par service (nginx, portfolio, dotclear…).</small>
+                </label>
+                <div class="grid2">
+                    <label>Distribution <select id="c-dist"></select></label>
+                    <label>Version <select id="c-rel"></select></label>
+                </div>
+                <label>Adresse IP fixe <em>(facultatif)</em>
+                    <input id="c-ip" autocomplete="off" spellcheck="false" placeholder="auto (DHCP)  ou  10.0.3.24">
+                    <small>Dans 10.0.3.2 – 10.0.3.254, Debian/Ubuntu uniquement. Vide = attribuée par le pont lxcbr0.</small>
+                </label>
+                <label class="check"><input type="checkbox" id="c-auto"> Démarrer automatiquement avec le serveur</label>
+                <label class="check"><input type="checkbox" id="c-start" checked> Démarrer après la création</label>
+                <pre id="c-log" class="log" hidden></pre>
+            </div>
+            <footer class="dlg-foot">
+                <button class="btn" type="button" data-close>Annuler</button>
+                <button class="btn primary" type="submit" id="c-go">Créer</button>
+            </footer>
+        </form>
+    </dialog>
+
+    <!-- Confirmation générique -->
+    <dialog id="confirm" class="small" aria-labelledby="k-title">
+        <form method="dialog" id="k-form">
+            <header class="dlg-head"><h2 id="k-title"></h2></header>
+            <div class="dlg-body form"><p id="k-text"></p>
+                <label id="k-typed-wrap" hidden>Tapez <strong id="k-word"></strong> pour confirmer
+                    <input id="k-typed" autocomplete="off" spellcheck="false">
+                </label>
+            </div>
+            <footer class="dlg-foot">
+                <button class="btn" type="button" data-close>Annuler</button>
+                <button class="btn" type="submit" id="k-ok">Confirmer</button>
+            </footer>
+        </form>
+    </dialog>
+
+    <script src="lxc.js"></script>
+</body>
+</html>

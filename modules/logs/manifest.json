@@ -1,0 +1,18 @@
+{
+    "version": "1.0",
+    "requires": {
+        "cockpit": "270"
+    },
+    "conditions": [
+        { "path-exists": "/usr/local/libexec/cockpit-logs" }
+    ],
+    "menu": {
+        "index": {
+            "label": "Journaux centralisés",
+            "order": 26,
+            "keywords": [
+                { "matches": ["logs", "journaux", "rsyslog", "syslog", "nginx", "fail2ban", "alertes", "erreurs"], "weight": 3 }
+            ]
+        }
+    }
+}

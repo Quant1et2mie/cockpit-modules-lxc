@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Journaux centralisés</title>
+    <link rel="stylesheet" href="../studio/studio.css">
+    <link rel="stylesheet" href="logs.css">
+    <script src="../base1/cockpit.js"></script>
+    <script src="../studio/studio.js"></script>
+</head>
+<body>
+    <main class="page">
+        <header class="head">
+            <div class="title">
+                <div class="glyph" id="glyph"></div>
+                <div>
+                    <p class="eyebrow">rsyslog · container logs (10.0.3.40)</p>
+                    <h1>Journaux centralisés</h1>
+                    <p class="sub" id="summary">Chargement…</p>
+                </div>
+            </div>
+            <div class="toolbar">
+                <select id="range" aria-label="Période du graphique">
+                    <option value="6">6 dernières heures</option>
+                    <option value="24" selected>24 dernières heures</option>
+                    <option value="72">3 derniers jours</option>
+                    <option value="168">7 derniers jours</option>
+                </select>
+                <button class="btn" id="refresh" type="button">Actualiser</button>
+            </div>
+        </header>
+
+        <div id="alert" class="alert" role="alert" hidden></div>
+
+        <section class="card" aria-labelledby="h-act">
+            <div class="card-head">
+                <h2 id="h-act">Activité</h2>
+                <div class="legend" aria-hidden="true">
+                    <span><i class="sw sw-ok"></i>Lignes</span>
+                    <span><i class="sw sw-err"></i>Erreurs</span>
+                </div>
+            </div>
+            <div id="chart" class="chart"></div>
+            <div id="tiles" class="tiles"></div>
+        </section>
+
+        <section class="card viewer" aria-labelledby="h-view">
+            <aside class="side">
+                <h2 id="h-view">Sources</h2>
+                <button class="src all" id="src-all" type="button">Toutes les machines</button>
+                <div id="tree" class="tree"></div>
+            </aside>
+
+            <div class="main">
+                <div class="vbar">
+                    <div class="where">
+                        <strong id="v-title">—</strong>
+                        <select id="v-file" aria-label="Fichier (y compris archives)"></select>
+                        <span class="live-ind" id="live-ind" hidden><span class="dot ok live" aria-hidden="true"></span>En direct</span>
+                    </div>
+                    <div class="filters">
+                        <div class="qwrap" id="qwrap">
+                            <input id="q" type="search" placeholder="Filtrer (texte, IP, code…)" autocomplete="off" spellcheck="false" aria-label="Filtrer les lignes">
+                        </div>
+                        <label class="check" title="Interpréter le filtre comme une expression régulière"><input type="checkbox" id="rx"> Regex</label>
+                        <label class="switch" title="Afficher les nouvelles lignes en direct (toutes les 2 s)">
+                            <input type="checkbox" id="live"><span class="track"></span><span>Direct</span>
+                        </label>
+                    </div>
+                    <div class="filters">
+                        <div class="pills" id="lvl" role="group" aria-label="Gravité"></div>
+                        <span class="grow"></span>
+                        <select id="n" aria-label="Nombre de lignes">
+                            <option value="200">200 lignes</option>
+                            <option value="1000" selected>1000 lignes</option>
+                            <option value="5000">5000 lignes</option>
+                        </select>
+                        <select id="hours" aria-label="Période de recherche" hidden>
+                            <option value="1">1 h</option>
+                            <option value="24" selected>24 h</option>
+                            <option value="168">7 jours</option>
+                            <option value="2160">90 jours</option>
+                        </select>
+                        <button class="btn small" id="dl" type="button" title="Télécharger les lignes affichées">Télécharger</button>
+                    </div>
+                </div>
+                <p class="meta" id="v-meta"></p>
+                <div class="log-wrap" id="log-wrap">
+                    <table class="log">
+                        <thead><tr><th>Heure</th><th class="c-host">Machine</th><th>Programme</th><th>Message</th></tr></thead>
+                        <tbody id="rows"></tbody>
+                    </table>
+                    <p class="empty" id="empty" hidden></p>
+                </div>
+            </div>
+        </section>
+
+        <section class="card" aria-labelledby="h-rep">
+            <div class="card-head">
+                <h2 id="h-rep">Alertes et rapports quotidiens</h2>
+                <select id="report" aria-label="Rapport"></select>
+            </div>
+            <div class="grid2">
+                <div>
+                    <h3>Dernières alertes</h3>
+                    <pre id="alerts" class="pre"></pre>
+                </div>
+                <div>
+                    <h3>Rapport</h3>
+                    <pre id="report-text" class="pre"></pre>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <div id="tip" class="tip" role="tooltip" hidden></div>
+    <script src="logs.js"></script>
+</body>
+</html>

@@ -1,0 +1,603 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+cockpit-lxc : assistant privilégié du module Cockpit « Conteneurs LXC ».
+
+Appelé UNIQUEMENT via sudo par le module (/usr/share/cockpit/lxc), avec une règle sudoers
+limitée à ce seul fichier (/etc/sudoers.d/cockpit-lxc). Le compte Cockpit n'est donc PAS
+administrateur de l'hôte : il ne peut faire que ce que ce script autorise.
+
+Principes de sécurité :
+  * liste blanche de sous-commandes, aucun shell, aucune commande arbitraire dans un container ;
+  * tous les arguments sont validés par expressions régulières strictes (nom, snapshot, IP, image...) ;
+  * un verrou empêche deux opérations de modification simultanées ;
+  * chaque modification est journalisée dans syslog (qui / quoi) ;
+  * les opérations continuent même si la connexion du navigateur tombe (cas typique :
+    redémarrer le container « nginx » qui sert justement Cockpit).
+
+Sortie : JSON sur stdout (sauf « create » qui diffuse sa progression en texte puis une ligne
+« __RESULT__ {json} »).
+"""
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import syslog
+import tempfile
+import time
+
+LXC = "/var/lib/lxc"
+CGROUP = "/sys/fs/cgroup"
+ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C.UTF-8", "HOME": "/root"}
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+SNAP_RE = re.compile(r"^snap[0-9]{1,6}$")
+UNIT_RE = re.compile(r"^[A-Za-z0-9@_.:\-]{1,80}$")
+IP_RE = re.compile(r"^10\.0\.3\.(?:[2-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-4])$")
+
+# Images proposées à la création (serveur d'images officiel de LXC)
+IMAGES = {
+    "debian": ["bookworm", "trixie"],
+    "ubuntu": ["jammy", "noble"],
+    "alpine": ["3.20", "3.21"],
+}
+
+# Diagnostics : commandes FIXES exécutables dans un container en marche (aucun paramètre libre)
+DIAG = {
+    "processes": ["ps", "aux", "--sort=-%mem"],
+    "services": ["systemctl", "list-units", "--type=service", "--state=running", "--no-pager"],
+    "failed": ["systemctl", "--failed", "--no-pager"],
+    "ports": ["ss", "-tlnp"],
+    "network": ["ip", "-br", "addr"],
+    "disk": ["df", "-h"],
+    "uptime": ["uptime"],
+    "updates": ["apt", "list", "--upgradable"],
+}
+
+
+# ------------------------------------------------------------------ utilitaires
+def emit(obj):
+    try:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass  # navigateur déconnecté : l'opération est déjà faite, rien à renvoyer
+    sys.exit(0)
+
+
+def fail(msg):
+    emit({"ok": False, "error": msg})
+
+
+def sh(cmd, timeout=60, check_out=False):
+    """Exécute une commande (sans shell), retourne (code, sortie). Session détachée du terminal
+    de l'appelant pour survivre à une déconnexion."""
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
+                           env=ENV, text=True, errors="replace", start_new_session=True)
+        return p.returncode, p.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return 124, "délai dépassé (%ss)" % timeout
+
+
+def audit(msg):
+    syslog.openlog("cockpit-lxc", 0, syslog.LOG_AUTH)
+    syslog.syslog(syslog.LOG_NOTICE, "%s : %s" % (os.environ.get("SUDO_USER", "?"), msg))
+
+
+def protect_from_hangup():
+    for s in (signal.SIGHUP, signal.SIGPIPE, signal.SIGTERM):
+        signal.signal(s, signal.SIG_IGN)
+
+
+_lock_fd = None
+
+
+def mutating(msg):
+    """À appeler au début de toute opération qui modifie l'état : verrou + audit + anti-SIGHUP."""
+    global _lock_fd
+    protect_from_hangup()
+    _lock_fd = os.open("/run/cockpit-lxc.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("Une autre opération est déjà en cours, réessayez dans un instant.")
+    audit(msg)
+
+
+def names():
+    try:
+        return sorted(n for n in os.listdir(LXC) if NAME_RE.match(n) and os.path.isfile("%s/%s/config" % (LXC, n)))
+    except FileNotFoundError:
+        return []
+
+
+def need(name):
+    if not name or not NAME_RE.match(name):
+        fail("Nom de container invalide.")
+    if name not in names():
+        fail("Container inconnu : %s" % name)
+    return name
+
+
+def state(name):
+    rc, out = sh(["lxc-info", "-n", name, "-sH"], 15)
+    return out.strip().upper() if rc == 0 and out else "UNKNOWN"
+
+
+def read_config(name):
+    conf = {}
+    try:
+        with open("%s/%s/config" % (LXC, name), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = [x.strip() for x in line.split("=", 1)]
+                conf.setdefault(k, []).append(v)
+    except OSError:
+        pass
+    return conf
+
+
+def rootfs_of(name):
+    for v in read_config(name).get("lxc.rootfs.path", []):
+        if v.startswith("dir:"):
+            return v[4:]
+    return "%s/%s/rootfs" % (LXC, name)
+
+
+def os_name(name):
+    try:
+        with open(os.path.join(rootfs_of(name), "etc/os-release"), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return ""
+
+
+def ips_of(name):
+    rc, out = sh(["lxc-info", "-n", name, "-iH"], 15)
+    if rc != 0:
+        return []
+    return [i.strip() for i in out.splitlines() if i.strip() and not i.startswith("127.") and ":" not in i]
+
+
+def cgroup_read(name, fname):
+    try:
+        with open("%s/lxc.payload.%s/%s" % (CGROUP, name, fname)) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def metrics(name):
+    m = {"mem": None, "mem_max": None, "cpu_usec": None, "pids": None}
+    v = cgroup_read(name, "memory.current")
+    if v and v.strip().isdigit():
+        m["mem"] = int(v)
+    v = cgroup_read(name, "memory.max")
+    if v and v.strip().isdigit():
+        m["mem_max"] = int(v)
+    v = cgroup_read(name, "cpu.stat")
+    if v:
+        for line in v.splitlines():
+            if line.startswith("usage_usec "):
+                m["cpu_usec"] = int(line.split()[1])
+    v = cgroup_read(name, "pids.current")
+    if v and v.strip().isdigit():
+        m["pids"] = int(v)
+    return m
+
+
+def mem_total():
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+def du_mb(path, timeout=25):
+    rc, out = sh(["du", "-sx", "--block-size=1M", path], timeout)
+    try:
+        return int(out.split()[0]) if rc == 0 else None
+    except (ValueError, IndexError):
+        return None
+
+
+# ------------------------------------------------------------------ lecture
+def cmd_list():
+    items = []
+    for n in names():
+        conf = read_config(n)
+        st = state(n)
+        item = {
+            "name": n,
+            "state": st,
+            "ips": ips_of(n) if st == "RUNNING" else [],
+            "os": os_name(n),
+            "autostart": (conf.get("lxc.start.auto", ["0"])[-1] == "1"),
+            "order": conf.get("lxc.start.order", [""])[-1],
+            "group": ",".join(conf.get("lxc.group", [])),
+            "privileged": "lxc.idmap" not in conf,
+        }
+        item.update(metrics(n) if st in ("RUNNING", "FROZEN") else {"mem": None, "mem_max": None, "cpu_usec": None, "pids": None})
+        items.append(item)
+    emit({"ok": True, "now": time.time(), "ncpu": os.cpu_count() or 1, "mem_total": mem_total(), "containers": items})
+
+
+def parse_snapshots(name):
+    rc, out = sh(["lxc-snapshot", "-n", name, "-L", "-C"], 20)
+    snaps = []
+    if rc != 0:
+        return snaps
+    # ex : "snap0 (/var/lib/lxcsnaps/web) 2026:09:21 20:00:00" (+ ligne de commentaire éventuelle)
+    for line in out.splitlines():
+        m = re.match(r"^(snap[0-9]+)\s+\((.*?)\)\s+(.*)$", line.strip())
+        if m:
+            snaps.append({"name": m.group(1), "path": m.group(2), "date": m.group(3).replace(":", "-", 2), "comment": ""})
+        elif snaps and line.strip():
+            snaps[-1]["comment"] = line.strip()
+    return snaps
+
+
+def cmd_info(name):
+    need(name)
+    st = state(name)
+    rc, out = sh(["lxc-info", "-n", name], 20)
+    parsed = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            parsed.setdefault(k.strip(), []).append(v.strip())
+    try:
+        with open("%s/%s/config" % (LXC, name), encoding="utf-8", errors="replace") as f:
+            cfg = f.read()
+    except OSError:
+        cfg = ""
+    emit({"ok": True, "name": name, "state": st, "info": parsed, "config": cfg,
+          "disk_mb": du_mb(rootfs_of(name)), "snapshots": parse_snapshots(name),
+          "free_mb": shutil.disk_usage(LXC).free // (1024 * 1024)})
+
+
+def cmd_logs(name, lines="200", unit=""):
+    need(name)
+    if state(name) != "RUNNING":
+        fail("Le container est arrêté : pas de journal à lire.")
+    try:
+        n = max(10, min(int(lines), 1000))
+    except ValueError:
+        fail("Nombre de lignes invalide.")
+    cmd = ["lxc-attach", "-n", name, "--", "journalctl", "-n", str(n), "--no-pager", "-o", "short-iso"]
+    if unit:
+        if not UNIT_RE.match(unit):
+            fail("Nom d'unité invalide.")
+        cmd += ["-u", unit]
+    rc, out = sh(cmd, 30)
+    emit({"ok": rc == 0, "output": out, "error": None if rc == 0 else out})
+
+
+def cmd_diag(name, preset):
+    need(name)
+    if preset not in DIAG:
+        fail("Diagnostic inconnu.")
+    if state(name) != "RUNNING":
+        fail("Le container est arrêté.")
+    rc, out = sh(["lxc-attach", "-n", name, "--"] + DIAG[preset], 30)
+    lines = out.splitlines()
+    if len(lines) > 400:
+        out = "\n".join(lines[:400]) + "\n… (%d lignes de plus)" % (len(lines) - 400)
+    emit({"ok": True, "output": out, "rc": rc})
+
+
+def cmd_routes():
+    """Table « domaine -> container » déduite de la config du reverse proxy nginx (lecture seule)."""
+    base = "%s/nginx/rootfs/etc/nginx/conf.d" % LXC
+    if not os.path.isdir(base):
+        emit({"ok": True, "routes": []})
+    ip_to_name = {}
+    for n in names():
+        for ip in ips_of(n):
+            ip_to_name[ip] = n
+        for v in read_config(n).get("lxc.net.0.ipv4.address", []):
+            ip_to_name.setdefault(v.split("/")[0], n)
+    routes, seen = [], set()
+    for fn in sorted(os.listdir(base)):
+        if not fn.endswith(".conf"):
+            continue
+        try:
+            text = open(os.path.join(base, fn), encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        text = re.sub(r"#.*", "", text)
+        i = 0
+        while True:  # extraction des blocs « server { ... } par comptage d'accolades
+            m = re.compile(r"\bserver\s*\{").search(text, i)
+            if not m:
+                break
+            depth, j = 1, m.end()
+            while j < len(text) and depth:
+                depth += {"{": 1, "}": -1}.get(text[j], 0)
+                j += 1
+            block, i = text[m.end():j - 1], j
+            # on privilégie le proxy_pass de « location / » (les autres, ex. /netdata/, sont annexes)
+            root = re.search(r"location\s+/\s*\{[^}]*?proxy_pass\s+https?://([0-9a-zA-Z.\-]+)(?::(\d+))?", block, re.S)
+            up = root or re.search(r"proxy_pass\s+https?://([0-9a-zA-Z.\-]+)(?::(\d+))?", block)
+            sn = re.search(r"server_name\s+([^;]+);", block)
+            if not up or not sn:
+                continue
+            domains = sn.group(1).split()
+            tls = bool(re.search(r"listen\s+[^;]*\bssl\b", block))
+            key = (tuple(domains), up.group(1), up.group(2) or "80")
+            if key in seen and not tls:
+                continue
+            seen.add(key)
+            routes.append({"domains": domains, "ip": up.group(1), "port": up.group(2) or "80",
+                           "container": "hôte" if up.group(1) == "10.0.3.1" else ip_to_name.get(up.group(1), ""), "tls": tls,
+                           "auth": bool(re.search(r"auth_basic\s+\"", block)), "conf": fn})
+    # une ligne par (domaines, backend) : on préfère l'entrée TLS quand elle existe
+    best = {}
+    for r in routes:
+        k = (tuple(r["domains"]), r["ip"], r["port"])
+        if k not in best or r["tls"]:
+            best[k] = r
+    emit({"ok": True, "routes": list(best.values())})
+
+
+def cmd_images():
+    emit({"ok": True, "images": IMAGES, "diag": sorted(DIAG)})
+
+
+# ------------------------------------------------------------------ modifications
+def wait_state(name, want, timeout=40):
+    end = time.time() + timeout
+    while time.time() < end:
+        if state(name) == want:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def do_start(name):
+    if state(name) == "RUNNING":
+        return True, "déjà en marche"
+    rc, out = sh(["lxc-start", "-n", name, "-d"], 60)
+    if rc != 0:
+        return False, out or "échec du démarrage"
+    return (True, "démarré") if wait_state(name, "RUNNING", 40) else (False, "le container n'a pas atteint l'état RUNNING")
+
+
+def do_stop(name):
+    if state(name) == "STOPPED":
+        return True, "déjà arrêté"
+    if state(name) == "FROZEN":
+        sh(["lxc-unfreeze", "-n", name], 15)
+    rc, out = sh(["lxc-stop", "-n", name, "-t", "30"], 90)
+    return (True, "arrêté") if state(name) == "STOPPED" else (False, out or "échec de l'arrêt")
+
+
+def cmd_action(action, name):
+    need(name)
+    mutating("%s %s" % (action, name))
+    if action == "start":
+        ok, msg = do_start(name)
+    elif action == "stop":
+        ok, msg = do_stop(name)
+    elif action == "restart":
+        ok, msg = do_stop(name)
+        if ok:
+            ok, msg = do_start(name)
+            msg = "redémarré" if ok else msg
+    elif action == "freeze":
+        rc, out = sh(["lxc-freeze", "-n", name], 20)
+        ok, msg = rc == 0, out or "gelé"
+    elif action == "unfreeze":
+        rc, out = sh(["lxc-unfreeze", "-n", name], 20)
+        ok, msg = rc == 0, out or "réactivé"
+    else:
+        fail("Action inconnue.")
+    emit({"ok": ok, "message": msg, "state": state(name)})
+
+
+def cmd_autostart(name, value):
+    need(name)
+    if value not in ("on", "off"):
+        fail("Valeur invalide (on/off).")
+    mutating("autostart %s %s" % (name, value))
+    path = "%s/%s/config" % (LXC, name)
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    new, done = [], False
+    for line in lines:
+        if re.match(r"^\s*lxc\.start\.auto\s*=", line):
+            new.append("lxc.start.auto = %d" % (1 if value == "on" else 0))
+            done = True
+        else:
+            new.append(line)
+    if not done:
+        new.append("lxc.start.auto = %d" % (1 if value == "on" else 0))
+    st = os.stat(path)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".config.")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("\n".join(new) + "\n")
+    os.chmod(tmp, st.st_mode & 0o777)
+    os.chown(tmp, st.st_uid, st.st_gid)
+    os.replace(tmp, path)
+    emit({"ok": True, "message": "démarrage automatique %s" % ("activé" if value == "on" else "désactivé")})
+
+
+def cmd_snapshot(name, comment=""):
+    need(name)
+    mutating("snapshot %s" % name)
+    size = du_mb(rootfs_of(name)) or 0
+    free = shutil.disk_usage(LXC).free // (1024 * 1024)
+    if free < size * 1.5 + 1024:
+        fail("Espace disque insuffisant : snapshot ≈ %d Mo, libre %d Mo (il faut garder ≥ 1 Go de marge)." % (size, free))
+    was_running = state(name) == "RUNNING"
+    if was_running:  # un container « dir » doit être arrêté pour un snapshot cohérent
+        ok, msg = do_stop(name)
+        if not ok:
+            fail("Impossible d'arrêter le container avant le snapshot : %s" % msg)
+    cmd = ["lxc-snapshot", "-n", name]
+    ctmp = None
+    if comment:
+        fd, ctmp = tempfile.mkstemp(prefix="lxc-comment-")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(comment[:200].replace("\n", " "))
+        cmd += ["-c", ctmp]
+    rc, out = sh(cmd, 900)
+    if ctmp:
+        os.unlink(ctmp)
+    restarted = ""
+    if was_running:
+        ok2, msg2 = do_start(name)
+        restarted = " Container redémarré." if ok2 else " ATTENTION : redémarrage échoué (%s)." % msg2
+    emit({"ok": rc == 0, "message": ("Snapshot créé." if rc == 0 else out) + restarted})
+
+
+def cmd_restore(name, snap):
+    need(name)
+    if not SNAP_RE.match(snap or ""):
+        fail("Nom de snapshot invalide.")
+    mutating("restore %s %s" % (name, snap))
+    was_running = state(name) == "RUNNING"
+    if was_running:
+        ok, msg = do_stop(name)
+        if not ok:
+            fail("Impossible d'arrêter le container : %s" % msg)
+    rc, out = sh(["lxc-snapshot", "-n", name, "-r", snap], 900)
+    restarted = ""
+    if was_running:
+        ok2, msg2 = do_start(name)
+        restarted = " Container redémarré." if ok2 else " ATTENTION : redémarrage échoué (%s)." % msg2
+    emit({"ok": rc == 0, "message": ("Snapshot %s restauré." % snap if rc == 0 else out) + restarted})
+
+
+def cmd_delsnapshot(name, snap):
+    need(name)
+    if not SNAP_RE.match(snap or ""):
+        fail("Nom de snapshot invalide.")
+    mutating("delsnapshot %s %s" % (name, snap))
+    rc, out = sh(["lxc-snapshot", "-n", name, "-d", snap], 300)
+    emit({"ok": rc == 0, "message": "Snapshot supprimé." if rc == 0 else out})
+
+
+def used_ips():
+    used = set()
+    for n in names():
+        used.update(ips_of(n))
+        try:
+            d = os.path.join(rootfs_of(n), "etc/systemd/network")
+            for fn in os.listdir(d):
+                for m in re.finditer(r"^Address=([0-9.]+)", open(os.path.join(d, fn)).read(), re.M):
+                    used.add(m.group(1))
+        except OSError:
+            pass
+    return used
+
+
+def cmd_create(name, dist, release, ip="", autostart="off", start="on"):
+    """Création avec progression diffusée ligne à ligne (le module lit le flux)."""
+    protect_from_hangup()
+    def out(line):
+        try:
+            print(line, flush=True)
+        except (BrokenPipeError, OSError):
+            pass
+    def result(obj):
+        out("__RESULT__ " + json.dumps(obj, ensure_ascii=False))
+        sys.exit(0)
+    if not NAME_RE.match(name or ""):
+        result({"ok": False, "error": "Nom invalide (minuscules, chiffres et tirets, 31 car. max)."})
+    if name in names():
+        result({"ok": False, "error": "Un container « %s » existe déjà." % name})
+    if release not in IMAGES.get(dist, []):
+        result({"ok": False, "error": "Image non proposée."})
+    if ip:
+        if not IP_RE.match(ip):
+            result({"ok": False, "error": "IP invalide : elle doit être dans 10.0.3.2 – 10.0.3.254."})
+        if ip in used_ips():
+            result({"ok": False, "error": "L'adresse %s est déjà utilisée par un autre container." % ip})
+        if dist == "alpine":
+            result({"ok": False, "error": "IP statique non gérée pour Alpine (laisser vide : DHCP)."})
+    mutating("create %s %s/%s ip=%s" % (name, dist, release, ip or "dhcp"))
+    out("→ Téléchargement de l'image %s %s (validée par signature)…" % (dist, release))
+    p = subprocess.Popen(["lxc-create", "-n", name, "-t", "download", "--", "--dist", dist,
+                          "--release", release, "--arch", "amd64"],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=ENV, text=True,
+                         errors="replace", start_new_session=True)
+    for line in p.stdout:
+        out(line.rstrip())
+    if p.wait() != 0:
+        shutil.rmtree("%s/%s" % (LXC, name), ignore_errors=True)
+        result({"ok": False, "error": "lxc-create a échoué (voir le journal ci-dessus)."})
+    cfg = "%s/%s/config" % (LXC, name)
+    with open(cfg, "a", encoding="utf-8") as f:
+        f.write("\n# Ajouté par le module Cockpit\nlxc.start.auto = %d\n" % (1 if autostart == "on" else 0))
+    if ip and dist in ("debian", "ubuntu"):
+        d = "%s/%s/rootfs/etc/systemd/network" % (LXC, name)
+        os.makedirs(d, exist_ok=True)
+        with open(d + "/eth0.network", "w") as f:
+            f.write("[Match]\nName=eth0\n\n[Network]\nAddress=%s/24\nGateway=10.0.3.1\nDNS=10.0.3.1\n" % ip)
+        out("→ IP statique %s configurée." % ip)
+    if start == "on":
+        out("→ Démarrage…")
+        ok, msg = do_start(name)
+        if not ok:
+            result({"ok": False, "error": "Container créé mais démarrage échoué : %s" % msg})
+    result({"ok": True, "message": "Container « %s » créé%s." % (name, " et démarré" if start == "on" else "")})
+
+
+def cmd_destroy(name, confirm):
+    need(name)
+    if confirm != name:
+        fail("Confirmation incorrecte : retapez exactement le nom du container.")
+    if state(name) != "STOPPED":
+        fail("Arrêtez d'abord le container avant de le supprimer.")
+    mutating("DESTROY %s" % name)
+    rc, out = sh(["lxc-destroy", "-n", name, "-s"], 300)
+    emit({"ok": rc == 0, "message": "Container supprimé." if rc == 0 else out})
+
+
+# ------------------------------------------------------------------ dispatch
+def main(argv):
+    if len(argv) < 2:
+        fail("Usage : cockpit-lxc <commande> [arguments]")
+    c, a = argv[1], argv[2:]
+    try:
+        if c == "list" and not a: cmd_list()
+        elif c == "routes" and not a: cmd_routes()
+        elif c == "images" and not a: cmd_images()
+        elif c == "info" and len(a) == 1: cmd_info(a[0])
+        elif c == "logs" and 1 <= len(a) <= 3: cmd_logs(*a)
+        elif c == "diag" and len(a) == 2: cmd_diag(*a)
+        elif c in ("start", "stop", "restart", "freeze", "unfreeze") and len(a) == 1: cmd_action(c, a[0])
+        elif c == "autostart" and len(a) == 2: cmd_autostart(*a)
+        elif c == "snapshot" and 1 <= len(a) <= 2: cmd_snapshot(*a)
+        elif c == "restore" and len(a) == 2: cmd_restore(*a)
+        elif c == "delsnapshot" and len(a) == 2: cmd_delsnapshot(*a)
+        elif c == "create" and 3 <= len(a) <= 6: cmd_create(*a)
+        elif c == "destroy" and len(a) == 2: cmd_destroy(*a)
+        else: fail("Commande ou arguments invalides.")
+    except SystemExit:
+        raise
+    except Exception as e:  # jamais de trace brute vers l'interface
+        audit("erreur interne %s : %r" % (c, e))
+        fail("Erreur interne : %s" % e)
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        print(json.dumps({"ok": False, "error": "Doit être lancé via sudo."}))
+        sys.exit(1)
+    main(sys.argv)

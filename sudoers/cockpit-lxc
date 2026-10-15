@@ -1,0 +1,3 @@
+# Module Cockpit « Conteneurs LXC » : ce compte peut lancer UNIQUEMENT l'assistant ci-dessous,
+# qui valide strictement ses arguments (voir l'en-tête du script). Il n'est PAS sudoer général.
+admin ALL=(root) NOPASSWD: /usr/local/libexec/cockpit-lxc

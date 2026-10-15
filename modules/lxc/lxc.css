@@ -1,0 +1,95 @@
+/* Module « Conteneurs LXC » — compléments au thème partagé ../studio/studio.css */
+.tiles { margin-bottom: 18px; }
+.tile.static { cursor: default; }
+.tile.static:hover { transform: none; box-shadow: none; border-color: var(--border); }
+.tile .nm svg { width: 15px; height: 15px; vertical-align: -3px; }
+.filterbar { display: flex; margin-bottom: 14px; }
+.filterbar .search { max-width: 460px; }
+
+/* ---------------------------------------------------------------- cartes conteneur */
+.ct-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 14px; }
+.ct {
+    position: relative; display: flex; flex-direction: column; gap: 12px; min-width: 0;
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px 16px;
+    transition: transform .2s var(--ease), box-shadow .2s var(--ease), border-color .2s var(--ease);
+}
+.ct:hover { box-shadow: var(--shadow); border-color: var(--accent-line); }
+.ct:focus-within { border-color: var(--accent-line); }
+.ct.on::before { content: ""; position: absolute; left: 0; top: 14px; bottom: 14px; width: 3px; border-radius: 0 3px 3px 0; background: var(--ok-solid); }
+.ct.busy { border-style: dashed; }
+.ct.busy::after { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+    background: linear-gradient(90deg, transparent, var(--accent-soft), transparent); background-size: 200% 100%; animation: st-shimmer 1.4s linear infinite; }
+.ct-skel { min-height: 170px; padding: 14px 16px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface-2); }
+.ct-top { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.ct-top .dot { margin-left: 2px; }
+.ct-id { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+.ct .name { font: 700 16px/1.2 var(--display); color: var(--ink); background: none; border: 0; padding: 0; cursor: pointer; text-align: left;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: -.01em; }
+.ct .name:hover { color: var(--accent); text-decoration: underline; text-underline-offset: 3px; }
+.ct .os { color: var(--faint); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ct-ip { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12.5px; min-width: 0; overflow-wrap: anywhere; }
+.ct-ip svg { width: 14px; height: 14px; flex: none; opacity: .7; }
+.ct-bars { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px 10px; align-items: center; }
+.ct-bars .lb { font: 600 10.5px/1 var(--mono); color: var(--faint); letter-spacing: .06em; }
+.mbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; min-width: 0; }
+.mbar .meter { height: 7px; }
+.mbar .v { font: 600 11.5px/1 var(--mono); color: var(--muted); white-space: nowrap; min-width: 60px; text-align: right; }
+.mbar.off .meter { opacity: .45; }
+.mbar.off .v { color: var(--faint); }
+.ct-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-top: auto;
+    padding-top: 10px; border-top: 1px solid var(--border); }
+.acts { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.switch.small { font-size: 12.5px; color: var(--muted); min-height: calc(var(--tap) - 6px); }
+.menu > summary.btn { list-style: none; }
+.menu-list { min-width: 220px; }
+
+/* ---------------------------------------------------------------- architecture */
+.arch { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 12px 14px; }
+.hop { display: flex; align-items: center; gap: 12px 14px; flex-wrap: wrap; }
+.node {
+    display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 9px 12px; border-radius: 12px; font: inherit; color: inherit;
+    background: var(--surface-2); border: 1px solid var(--border); min-height: var(--tap); text-align: left; cursor: pointer;
+    transition: border-color .16s, box-shadow .16s;
+}
+button.node:hover:not(:disabled) { border-color: var(--accent-line); box-shadow: var(--shadow-sm); }
+button.node:disabled { cursor: default; }
+.node.static { cursor: default; }
+.node svg { width: 16px; height: 16px; }
+.node small { color: var(--faint); font-size: 11.5px; }
+.node.proxy { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent-soft); }
+.arrow { color: var(--faint); font-size: 18px; }
+.backends { display: flex; flex-direction: column; gap: 8px; flex: 1 1 420px; min-width: 0; }
+.route { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 10px; align-items: center;
+    padding: 6px 8px; border-radius: 10px; transition: background .15s; }
+.route:hover { background: var(--hover); }
+.route.dead .node { border-color: color-mix(in srgb, var(--danger-solid) 50%, transparent); }
+.route .dom { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; min-width: 0; overflow-wrap: anywhere; }
+.route .dom a { font-weight: 600; text-decoration: none; }
+.route .dom a:hover { text-decoration: underline; }
+.route .node { width: 100%; padding: 6px 10px; min-height: 0; }
+
+/* ---------------------------------------------------------------- dialogues */
+.form { display: flex; flex-direction: column; gap: 14px; }
+.form > label, .form .grid2 > label { display: flex; flex-direction: column; gap: 6px; font-weight: 600; font-size: 13px; color: var(--muted); }
+.form label.check { flex-direction: row; font-weight: 500; color: var(--text); }
+.form small { font-weight: 400; color: var(--faint); font-size: 12px; }
+.form em { font-weight: 400; color: var(--faint); }
+.form .grid2 { gap: 12px; }
+#d-title { display: flex; align-items: center; gap: 4px; }
+#detail .tabs { margin: 4px 18px 6px; }
+#detail .dlg-body { min-height: 260px; }
+.row { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; }
+.row > input { flex: 1 1 180px; min-width: 0; }
+.tab svg { width: 15px; height: 15px; }
+pre.log { max-height: 55vh; }
+
+@media (max-width: 720px) {
+    .ct-grid { grid-template-columns: minmax(0, 1fr); }
+    .route { grid-template-columns: minmax(0, 1fr); gap: 4px; }
+    .route .arrow { display: none; }
+    .hop .arrow.down { transform: rotate(90deg); }
+    .filterbar .search { max-width: none; }
+    .toolbar .switch { flex: 1 1 100%; }
+    .form .grid2 { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 380px) { .acts .btn.ghost { display: none; } }

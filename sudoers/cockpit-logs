@@ -1,0 +1,3 @@
+# Module Cockpit « Journaux centralisés » : ce compte peut lancer UNIQUEMENT l'assistant ci-dessous,
+# en LECTURE SEULE sur /var/lib/lxc/logs/rootfs/var/log/remote. Il n'est PAS sudoer général.
+admin ALL=(root) NOPASSWD: /usr/local/libexec/cockpit-logs

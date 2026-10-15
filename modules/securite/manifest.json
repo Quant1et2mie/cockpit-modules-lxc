@@ -1,0 +1,19 @@
+{
+    "version": "1.0",
+    "requires": {
+        "cockpit": "270"
+    },
+    "conditions": [
+        { "path-exists": "/usr/local/libexec/cockpit-securite" }
+    ],
+    "menu": {
+        "index": {
+            "label": "Sécurité et tâches",
+            "order": 27,
+            "keywords": [
+                { "matches": ["fail2ban", "prisons", "jails", "ban", "bannissement", "ip", "whois", "cron", "timers",
+                              "tâches", "certificats", "ssl", "tls", "letsencrypt", "ports", "mises à jour", "sauvegardes"], "weight": 3 }
+            ]
+        }
+    }
+}

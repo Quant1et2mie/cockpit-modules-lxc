@@ -1,0 +1,764 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+cockpit-securite : assistant du module Cockpit « Sécurité et tâches ».
+
+Appelé UNIQUEMENT via sudo par le module (/usr/share/cockpit/securite), avec une règle sudoers
+limitée à ce seul fichier (/etc/sudoers.d/cockpit-securite).
+
+Lecture : prisons fail2ban (hôte + containers), historique des bannissements, recherche d'IP,
+tâches planifiées (timers systemd + crontabs), certificats TLS, ports, mises à jour, sauvegardes.
+Écriture (seulement 3 actions, toutes journalisées dans syslog, étiquette « cockpit-securite ») :
+  ban / unban d'une IP dans une prison existante, lancement immédiat d'un timer existant.
+
+Sécurité :
+  * liste blanche de sous-commandes, arguments validés (module ipaddress, expressions régulières),
+    instance / prison / timer vérifiés contre la liste RÉELLE avant toute action ;
+  * aucune commande passée par un shell avec des données venant du navigateur ;
+  * interdiction de bannir une adresse privée, de bouclage ou du réseau des containers.
+
+Sortie : JSON sur stdout ; en cas d'erreur, message en clair sur stderr et code retour 2.
+"""
+import glob
+import hashlib
+import gzip
+import ipaddress
+import json
+import os
+import re
+import socket
+import ssl
+import subprocess
+import sys
+import syslog
+import time
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+
+HOST = "hôte"
+LXC_ROOT = "/var/lib/lxc"
+CERT_CONTAINER = "nginx"            # reverse proxy : terminaison TLS + Let's Encrypt
+PROXY_IP = "10.0.3.10"
+LXC_NET = ipaddress.ip_network("10.0.3.0/24")
+BACKUP_DIR = "/root/backups"
+IPSETS = ("ssh_allow", "ip_france", "ip_malveillantes")
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,40}$")
+JAIL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,60}$")
+TIMER_RE = re.compile(r"^[A-Za-z0-9@_.:-]{1,120}\.timer$")
+F2B_LINE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+ fail2ban\.\w+\s+\[\d+\]: \w+\s+\[([^\]]+)\] "
+                      r"(Found|Ban|Unban|Restore Ban|Increase Ban) (\S+)")
+MAX_F2B_SCAN = 48 * 1024 * 1024
+
+
+def fail(msg, code=2):
+    sys.stderr.write(msg + "\n")
+    sys.exit(code)
+
+
+def audit(msg):
+    syslog.openlog("cockpit-securite", 0, syslog.LOG_AUTH)
+    syslog.syslog(syslog.LOG_NOTICE, "%s (utilisateur Cockpit : %s)" % (msg, os.environ.get("SUDO_USER", "?")))
+
+
+def run(cmd, timeout=20, ok_codes=(0,)):
+    """Lance une commande SANS shell ; renvoie (code, stdout)."""
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout,
+                           env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except OSError as e:
+        return 127, str(e)
+    return p.returncode, p.stdout.decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------- instances (hôte + containers)
+def containers():
+    out = []
+    for d in sorted(os.listdir(LXC_ROOT)):
+        if NAME_RE.match(d) and os.path.isfile(os.path.join(LXC_ROOT, d, "config")):
+            code, st = run(["lxc-info", "-n", d, "-sH"], timeout=5)
+            out.append({"name": d, "running": st.strip() == "RUNNING"})
+    return out
+
+
+def rootfs(inst):
+    return "/" if inst == HOST else os.path.join(LXC_ROOT, inst, "rootfs")
+
+
+def in_inst(inst, cmd, timeout=20):
+    if inst == HOST:
+        return run(cmd, timeout)
+    return run(["lxc-attach", "-n", inst, "--clear-env", "--"] + cmd, timeout)
+
+
+def pmap(fn, items):
+    """Interroge plusieurs instances en parallèle (lxc-attach est lent en série)."""
+    items = list(items)
+    with ThreadPoolExecutor(max_workers=max(1, min(8, len(items)))) as ex:
+        return list(ex.map(fn, items))
+
+
+def running_instances():
+    return [HOST] + [c["name"] for c in containers() if c["running"]]
+
+
+def check_inst(inst, need_running=True):
+    if inst == HOST:
+        return inst
+    if not NAME_RE.match(inst or "") or not os.path.isdir(rootfs(inst)):
+        fail("instance inconnue")
+    if need_running and inst not in running_instances():
+        fail("le container « %s » est arrêté" % inst)
+    return inst
+
+
+def has_f2b(inst):
+    return os.path.exists(os.path.join(rootfs(inst), "usr/bin/fail2ban-client"))
+
+
+def check_ip(s):
+    try:
+        ip = ipaddress.ip_address((s or "").strip())
+    except ValueError:
+        fail("adresse IP invalide")
+    return ip
+
+
+# ---------------------------------------------------------------- fail2ban
+# Exécuté DANS l'instance : un seul processus parle directement au socket de fail2ban
+# (fail2ban-client coûte ~0,5 s par appel ; ici tout l'état est lu en une fois). Pas de donnée utilisateur.
+F2B_PY = r"""
+import json
+from fail2ban.client.csocket import CSocket
+res = {"up": False, "jails": []}
+try:
+    s = CSocket("/var/run/fail2ban/fail2ban.sock")
+    names = [j.strip() for j in dict(s.send(["status"])[1]).get("Jail list", "").split(",") if j.strip()]
+    res["up"] = True
+    for n in names:
+        st = s.send(["status", n])[1]
+        f, a = dict(dict(st)["Filter"]), dict(dict(st)["Actions"])
+        j = {"name": n, "failed": f.get("Currently failed", 0), "total_failed": f.get("Total failed", 0),
+             "banned": a.get("Currently banned", 0), "total_banned": a.get("Total banned", 0),
+             "ips": list(a.get("Banned IP list", [])), "files": list(f.get("File list", f.get("Journal matches", [])))}
+        for k in ("bantime", "findtime", "maxretry"):
+            j[k] = s.send(["get", n, k])[1]
+        res["jails"].append(j)
+    s.close()
+except Exception as e:
+    res["error"] = str(e)
+print(json.dumps(res))
+"""
+
+
+def jails_of(inst):
+    code, out = in_inst(inst, ["python3", "-c", F2B_PY], timeout=30)
+    try:
+        d = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        d = {"up": False, "jails": [], "error": out.strip()[:300]}
+    return {"instance": inst, "running": d.get("up", False), "jails": d.get("jails", []), "error": d.get("error")}
+
+
+def cmd_jails(_args):
+    return {"instances": pmap(jails_of, [i for i in running_instances() if has_f2b(i)])}
+
+
+def f2b_logs(inst):
+    base = os.path.join(rootfs(inst), "var/log")
+    files = []
+    for p in glob.glob(os.path.join(base, "fail2ban.log*")):
+        real = os.path.realpath(p)
+        if real.startswith(os.path.realpath(base) + os.sep) and os.path.isfile(real) and not os.path.islink(p):
+            files.append(real)
+    # du plus ancien au plus récent : fail2ban.log.4.gz … fail2ban.log.1, fail2ban.log
+    def order(p):
+        m = re.search(r"\.log\.(\d+)", p)
+        return -int(m.group(1)) if m else 0
+    return sorted(files, key=order)
+
+
+def iter_f2b(inst, since=None):
+    budget = MAX_F2B_SCAN
+    for p in f2b_logs(inst):
+        if since and os.path.getmtime(p) < since.timestamp():
+            continue
+        opener = gzip.open if p.endswith(".gz") else open
+        with opener(p, "rt", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                budget -= len(line)
+                if budget < 0:
+                    return
+                m = F2B_LINE.match(line)
+                if not m:
+                    continue
+                t = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                yield t, m.group(2), m.group(3), m.group(4)
+
+
+def local_tz_offset():
+    # les journaux fail2ban sont en heure locale du système concerné (UTC sur l'hôte et les containers)
+    return timezone.utc
+
+
+def cmd_history(args):
+    days = 30
+    if args[:1] == ["--days"] and len(args) == 2 and re.match(r"^\d{1,3}$", args[1]):
+        days = max(1, min(int(args[1]), 365))
+    elif args:
+        fail("usage : history [--days N]")
+    since = datetime.now() - timedelta(days=days)
+    events, found = [], Counter()
+    per_day = defaultdict(lambda: {"ban": 0, "found": 0})
+    for inst in [HOST] + [c["name"] for c in containers()]:
+        if not has_f2b(inst):
+            continue
+        for t, jail, action, ip in iter_f2b(inst, since):
+            if t < since:
+                continue
+            day = t.strftime("%Y-%m-%d")
+            if action == "Found":
+                found[(inst, jail)] += 1
+                per_day[day]["found"] += 1
+                continue
+            if action in ("Ban", "Increase Ban"):
+                per_day[day]["ban"] += 1
+            events.append({"t": t.replace(tzinfo=local_tz_offset()).isoformat(), "i": inst, "j": jail,
+                           "a": action, "ip": ip})
+    events.sort(key=lambda e: e["t"], reverse=True)
+    ban_ips = Counter(e["ip"] for e in events if e["a"] == "Ban")
+    return {"days": days, "events": events[:5000], "total": len(events),
+            "per_day": [dict(d=k, **v) for k, v in sorted(per_day.items())],
+            "found": [{"i": k[0], "j": k[1], "n": v} for k, v in found.most_common()],
+            "top": [{"ip": ip, "n": n} for ip, n in ban_ips.most_common(15)]}
+
+
+def cmd_ban(args, unban=False):
+    if len(args) != 3:
+        fail("usage : %s <instance> <prison|--all> <ip>" % ("unban" if unban else "ban"))
+    inst, jail, ip = check_inst(args[0]), args[1], check_ip(args[2])
+    if not has_f2b(inst):
+        fail("fail2ban n'est pas installé sur « %s »" % inst)
+    if not unban and (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+                      or ip.is_reserved or ip.is_unspecified or ip in LXC_NET):
+        fail("refusé : %s est une adresse privée / réservée (risque de couper l'accès interne)" % ip)
+    known = [j["name"] for j in jails_of(inst)["jails"]]
+    if unban and jail == "--all":
+        cmd = ["fail2ban-client", "unban", str(ip)]
+    else:
+        if not JAIL_RE.match(jail) or jail not in known:
+            fail("prison inconnue sur « %s »" % inst)
+        cmd = ["fail2ban-client", "set", jail, "unbanip" if unban else "banip", str(ip)]
+    code, out = in_inst(inst, cmd)
+    audit("%s %s prison=%s instance=%s -> code %d" % ("UNBAN" if unban else "BAN", ip, jail, inst, code))
+    if code != 0:
+        fail("fail2ban a refusé : %s" % out.strip()[:500])
+    return {"ok": True, "output": out.strip()[:500]}
+
+
+# ---------------------------------------------------------------- recherche d'IP
+WHOIS_KEYS = {
+    "country": "pays", "netname": "réseau", "descr": "description", "org-name": "organisation",
+    "orgname": "organisation", "organization": "organisation", "owner": "organisation",
+    "inetnum": "plage", "netrange": "plage", "cidr": "plage", "route": "route", "origin": "AS",
+    "originas": "AS", "abuse-mailbox": "abus", "orgabuseemail": "abus", "role": "contact",
+}
+
+
+def whois(ip):
+    code, out = run(["whois", str(ip)], timeout=12)
+    if code == 124:
+        return {"error": "délai dépassé"}
+    info = {}
+    for line in out.splitlines():
+        m = re.match(r"^\s*([A-Za-z-]+):\s+(.+?)\s*$", line)
+        if not m:
+            continue
+        k = WHOIS_KEYS.get(m.group(1).lower())
+        if k and k not in info:
+            info[k] = m.group(2)[:200]
+    return info
+
+
+def rdns(ip):
+    socket.setdefaulttimeout(4)
+    try:
+        return socket.gethostbyaddr(str(ip))[0]
+    except (OSError, socket.herror):
+        return None
+
+
+def nginx_hits(ip, limit=40):
+    base = os.path.join(rootfs(CERT_CONTAINER), "var/log/nginx")
+    needle = str(ip) + " "
+    per, last, total = Counter(), [], 0
+    for p in sorted(glob.glob(os.path.join(base, "*access.log*"))):
+        if os.path.islink(p) or not os.path.isfile(p):
+            continue
+        vhost = os.path.basename(p).split(".access")[0].split("access")[0].strip(".") or "défaut"
+        opener = gzip.open if p.endswith(".gz") else open
+        try:
+            with opener(p, "rt", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.startswith(needle):
+                        total += 1
+                        per[vhost] += 1
+                        last.append((vhost, line.rstrip("\n")[:600]))
+        except (OSError, EOFError):
+            continue
+    m = re.compile(r'\[([^\]]+)\] "([^"]*)" (\d{3})')
+    rows = []
+    for vhost, line in last:
+        g = m.search(line)
+        if g:
+            try:
+                t = datetime.strptime(g.group(1), "%d/%b/%Y:%H:%M:%S %z").isoformat()
+            except ValueError:
+                t = g.group(1)
+            rows.append({"t": t, "v": vhost, "r": g.group(2)[:300], "s": int(g.group(3)),
+                         "ua": line.rsplit('"', 2)[-2][:200] if line.count('"') >= 6 else ""})
+    rows.sort(key=lambda r: r["t"])
+    return {"total": total, "per_vhost": dict(per), "last": rows[-limit:]}
+
+
+def cmd_ip(args):
+    if len(args) != 1:
+        fail("usage : ip <adresse>")
+    ip = check_ip(args[0])
+    s = str(ip)
+    bans = []
+    for res in pmap(jails_of, [i for i in running_instances() if has_f2b(i)]):
+        for j in res["jails"]:
+            if s in j["ips"]:
+                bans.append({"i": res["instance"], "j": j["name"], "bantime": j.get("bantime")})
+    hist = [e for e in cmd_history(["--days", "365"])["events"] if e["ip"] == s]
+    found = Counter()
+    for inst in [HOST] + [c["name"] for c in containers()]:
+        if has_f2b(inst):
+            for t, jail, action, eip in iter_f2b(inst):
+                if action == "Found" and eip == s:
+                    found["%s / %s" % (inst, jail)] += 1
+    sets = {}
+    for name in IPSETS:
+        code, _ = run(["ipset", "test", name, s], timeout=5)
+        sets[name] = (code == 0)
+    code, out = run(["journalctl", "-k", "--since", "-7d", "--no-pager", "-q", "-g", "SSH-GEOBLOCK.*SRC=%s " % re.escape(s)],
+                    timeout=20)
+    geoblock = len([l for l in out.splitlines() if "SRC=" + s + " " in l]) if code in (0, 1) else None
+    code, out = run(["journalctl", "--since", "-30d", "--no-pager", "-q", "-o", "short-iso", "_COMM=sshd",
+                     "-g", re.escape(s)], timeout=20)
+    ssh = [l[:400] for l in out.splitlines() if s in l][-20:] if code in (0, 1) else []
+    return {"ip": s, "version": ip.version, "private": ip.is_private, "rdns": rdns(ip),
+            "whois": {} if ip.is_private else whois(ip), "bans": bans, "history": hist,
+            "found": dict(found), "ipsets": sets, "geoblock_7d": geoblock, "ssh": ssh, "nginx": nginx_hits(ip)}
+
+
+# ---------------------------------------------------------------- tâches planifiées
+UNIT_PROPS = ["Description", "Result", "ActiveState", "ExecMainStatus", "ExecMainStartTimestamp",
+              "ExecMainExitTimestamp", "UnitFileState"]
+
+
+def usec_iso(v):
+    if not v:
+        return None
+    try:
+        return datetime.fromtimestamp(int(v) / 1e6, timezone.utc).isoformat()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def timers_of(inst):
+    if not os.path.exists(os.path.join(rootfs(inst), "bin/systemctl")) and \
+       not os.path.exists(os.path.join(rootfs(inst), "usr/bin/systemctl")):
+        return []
+    code, out = in_inst(inst, ["systemctl", "list-timers", "--all", "--output=json", "--no-pager"])
+    try:
+        timers = json.loads(out)
+    except ValueError:
+        return []
+    services = [t.get("activates") for t in timers if t.get("activates")]
+    props = {}
+    if services:
+        code, out = in_inst(inst, ["systemctl", "show", "--no-pager", "-p", ",".join(UNIT_PROPS + ["Id"])] + services)
+        for block in out.strip().split("\n\n"):
+            d = dict(l.split("=", 1) for l in block.splitlines() if "=" in l)
+            if d.get("Id"):
+                props[d["Id"]] = d
+    code, out = in_inst(inst, ["systemctl", "show", "--no-pager", "-p", "Id,TimersCalendar,TimersMonotonic,UnitFileState"]
+                        + [t["unit"] for t in timers])
+    tprops = {}
+    for block in out.strip().split("\n\n"):
+        d = dict(l.split("=", 1) for l in block.splitlines() if "=" in l)
+        if d.get("Id"):
+            tprops[d["Id"]] = d
+    res = []
+    for t in timers:
+        sv = props.get(t.get("activates"), {})
+        tp = tprops.get(t["unit"], {})
+        cal = re.findall(r"OnCalendar=([^;]+?) ;", tp.get("TimersCalendar", ""))
+        mono = re.findall(r"\{ (On\w+)=([^;]+?) ;", tp.get("TimersMonotonic", ""))
+        res.append({"unit": t["unit"], "service": t.get("activates"), "next": usec_iso(t.get("next")),
+                    "last": usec_iso(t.get("last")), "enabled": tp.get("UnitFileState", ""),
+                    "schedule": ", ".join(cal + ["%s %s" % m for m in mono]),
+                    "desc": sv.get("Description", ""), "result": sv.get("Result", ""),
+                    "state": sv.get("ActiveState", ""), "status": sv.get("ExecMainStatus", "")})
+    return res
+
+
+CRON_FILES = ["etc/crontab", "etc/cron.d/*", "var/spool/cron/crontabs/*", "etc/crontabs/*"]
+CRON_LINE = re.compile(r"^\s*(@\w+|[\d*/,-]+\s+[\d*/,-]+\s+[\d*/,-]+\s+[\w*/,-]+\s+[\w*/,-]+)\s+(.+)$")
+
+
+def crons_of(inst):
+    base = rootfs(inst)
+    entries = []
+    for pat in CRON_FILES:
+        for p in sorted(glob.glob(os.path.join(base, pat))):
+            if os.path.islink(p) or not os.path.isfile(p) or os.path.basename(p).startswith("."):
+                continue
+            rel = "/" + os.path.relpath(p, base)
+            user_file = "/spool/" in rel or "/crontabs/" in rel
+            try:
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    lines = fh.read(256 * 1024).splitlines()
+            except OSError:
+                continue
+            for l in lines:
+                m = CRON_LINE.match(l)
+                if not m or l.lstrip().startswith("#"):
+                    continue
+                cmd = m.group(2)
+                user = os.path.basename(p) if user_file else None
+                if not user_file:
+                    parts = cmd.split(None, 1)
+                    user, cmd = (parts[0], parts[1] if len(parts) > 1 else "")
+                entries.append({"file": rel, "when": m.group(1), "user": user, "cmd": cmd[:500]})
+    daemon = None
+    for b in ("usr/sbin/cron", "usr/sbin/crond", "sbin/crond"):
+        if os.path.exists(os.path.join(base, b)):
+            daemon = os.path.basename(b)
+    running = False
+    if daemon:
+        code, out = in_inst(inst, ["pidof", daemon], timeout=5)
+        running = code == 0 and bool(out.strip())
+    return {"daemon": daemon, "running": running, "entries": entries}
+
+
+def cmd_tasks(_args):
+    out = pmap(lambda i: {"instance": i, "timers": timers_of(i), "cron": crons_of(i)}, running_instances())
+    return {"instances": out, "now": datetime.now(timezone.utc).isoformat()}
+
+
+def cmd_run(args):
+    if len(args) != 2 or not TIMER_RE.match(args[1]):
+        fail("usage : run <instance> <nom.timer>")
+    inst = check_inst(args[0])
+    timers = {t["unit"]: t for t in timers_of(inst)}
+    if args[1] not in timers or not timers[args[1]]["service"]:
+        fail("timer inconnu sur « %s »" % inst)
+    svc = timers[args[1]]["service"]
+    code, out = in_inst(inst, ["systemctl", "start", "--no-block", svc])
+    audit("RUN %s (via %s) instance=%s -> code %d" % (svc, args[1], inst, code))
+    if code != 0:
+        fail("échec du lancement : %s" % out.strip()[:500])
+    return {"ok": True, "service": svc}
+
+
+# ---------------------------------------------------------------- certificats
+def x509(pem_path):
+    code, out = run(["openssl", "x509", "-in", pem_path, "-noout", "-subject", "-issuer", "-startdate", "-enddate",
+                     "-serial", "-fingerprint", "-sha256", "-ext", "subjectAltName", "-text"], timeout=10)
+    if code != 0:
+        return None
+    g = lambda rx: (re.search(rx, out, re.M) or [None, None])[1]
+    end = g(r"^notAfter=(.+)$")
+    start = g(r"^notBefore=(.+)$")
+    parse = lambda s: datetime.strptime(s, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc) if s else None
+    e = parse(end)
+    return {"subject": g(r"^subject=\s*(.+)$"), "issuer": g(r"^issuer=\s*(.+)$"),
+            "start": parse(start).isoformat() if start else None, "end": e.isoformat() if e else None,
+            "days": (e - datetime.now(timezone.utc)).days if e else None,
+            "serial": g(r"^serial=(.+)$"), "sha256": g(r"Fingerprint=(.+)$"),
+            "sans": list(dict.fromkeys(re.findall(r"DNS:([^,\s]+)", out))),
+            "key": g(r"Public Key Algorithm: (.+)$"), "bits": g(r"Public-Key: \((\d+) bit\)"),
+            "curve": g(r"NIST CURVE: (.+)$")}
+
+
+def _der_serial(der):
+    """Numéro de série (hex majuscule, comme openssl -serial) lu dans un certificat DER."""
+    def tlv(b, i):
+        tag, ln = b[i], b[i + 1]; i += 2
+        if ln & 0x80:
+            n = ln & 0x7F; ln = int.from_bytes(b[i:i + n], "big"); i += n
+        return tag, i, i + ln
+    _, i, _ = tlv(der, 0)          # Certificate
+    _, i, _ = tlv(der, i)          # tbsCertificate
+    tag, a, z = tlv(der, i)
+    if tag == 0xA0:                # [0] version (facultatif)
+        tag, a, z = tlv(der, z)
+    v = der[a:z].lstrip(b"\x00")
+    return (v.hex().upper() or "0") if tag == 0x02 else None
+
+
+def served(domain):
+    """Certificat réellement servi par le reverse proxy pour ce nom (SNI).
+    En Python natif : 2 processus openssl par nom saturaient le CPU (≈ 2 s chacun en parallèle)."""
+    # contexte nu : create_default_context() charge tout le magasin de CA à chaque appel (≈ 0,2 s, sous le GIL)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((PROXY_IP, 443), timeout=5) as raw:
+            with ctx.wrap_socket(raw, server_hostname=domain) as tls:
+                return _der_serial(tls.getpeercert(binary_form=True))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def cmd_certs(_args):
+    base = os.path.join(rootfs(CERT_CONTAINER), "etc/letsencrypt")
+    certs = []
+    pems = [os.path.realpath(os.path.join(d, "cert.pem")) for d in glob.glob(os.path.join(base, "live/*/"))]
+    pems = [p for p in pems if p.startswith(os.path.realpath(base) + os.sep) and os.path.isfile(p)]
+    X509 = dict(zip(pems, pmap(x509, pems)))
+    for d in sorted(glob.glob(os.path.join(base, "live/*/"))):
+        name = os.path.basename(d.rstrip("/"))
+        pem = os.path.realpath(os.path.join(d, "cert.pem"))
+        if not pem.startswith(os.path.realpath(base) + os.sep) or not os.path.isfile(pem):
+            continue
+        info = X509.get(pem)
+        if not info:
+            continue
+        renewal = {}
+        rp = os.path.join(base, "renewal", name + ".conf")
+        if os.path.isfile(rp) and not os.path.islink(rp):
+            with open(rp, encoding="utf-8", errors="replace") as fh:
+                for l in fh:
+                    m = re.match(r"^\s*(authenticator|webroot_path|key_type|server|renew_before_expiry)\s*=\s*(.+?)\s*$", l)
+                    if m:
+                        renewal[m.group(1)] = m.group(2)
+        info.update({"name": name, "source": "Let's Encrypt (%s)" % CERT_CONTAINER, "renewal": renewal})
+        certs.append(info)
+    # vérifs SNI : tous les noms de tous les certificats en un seul lot parallèle, sans doublon
+    # (avant : un lot par certificat → 6-8 s). Un nom joker (*.x) ne se teste pas tel quel.
+    names = list(dict.fromkeys(n for c in certs for n in c["sans"][:20] if not n.startswith("*.")))
+    got = dict(zip(names, pmap(served, names)))
+    for c in certs:
+        c["served"] = {n: got.get(n) for n in c["sans"][:20] if not n.startswith("*.")}
+    # certificat interne de Cockpit (hôte)
+    for p in sorted(glob.glob("/etc/cockpit/ws-certs.d/*.cert")):
+        info = x509(p)
+        if info:
+            info.update({"name": os.path.basename(p), "source": "Cockpit (hôte, interne)", "renewal": {}, "served": {}})
+            certs.append(info)
+    return {"certs": certs}
+
+
+# ---------------------------------------------------------------- système (ports, mises à jour, accès…)
+def ports_of(inst):
+    code, out = in_inst(inst, ["ss", "-H", "-ltunp"], timeout=10)
+    if code != 0:
+        code, out = in_inst(inst, ["netstat", "-ltunp"], timeout=10)
+        rows = []
+        for l in out.splitlines():
+            p = l.split()
+            if len(p) >= 6 and p[0] in ("tcp", "udp", "tcp6", "udp6"):
+                prog = p[-1].split("/", 1)[-1] if "/" in p[-1] else ""
+                rows.append({"proto": p[0], "addr": p[3], "proc": prog})
+        return rows
+    rows = []
+    for l in out.splitlines():
+        p = l.split()
+        if len(p) < 5:
+            continue
+        proc = re.findall(r'\("([^"]+)"', l)
+        rows.append({"proto": p[0], "addr": p[4], "proc": ",".join(sorted(set(proc)))})
+    uniq = {(r["proto"], r["addr"]): r for r in rows}
+    return sorted(uniq.values(), key=lambda r: (r["proto"], r["addr"]))
+
+
+UPD_CACHE = "/var/cache/cockpit-securite"
+UPD_TTL = 3600  # s : la recherche de MAJ (apt/apk dans chaque container) coûte ~20 s de CPU → 1 h de cache
+
+
+def updates_of(inst):
+    """Résultat mis en cache 1 h par instance (fichier root 600) : évite de relancer apt/apk partout
+    à chaque ouverture du module Sécurité ou du tableau de bord."""
+    cf = os.path.join(UPD_CACHE, "updates-%s.json" % re.sub(r"[^A-Za-z0-9_.-]", "_", str(inst)))
+    try:
+        if time.time() - os.path.getmtime(cf) < UPD_TTL:
+            with open(cf) as f:
+                return json.load(f)
+    except (OSError, ValueError):
+        pass
+    res = _updates_of(inst)
+    try:
+        os.makedirs(UPD_CACHE, mode=0o700, exist_ok=True)
+        tmp = cf + ".tmp"
+        with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            json.dump(res, f)
+        os.replace(tmp, cf)
+    except OSError:
+        pass
+    return res
+
+
+def _updates_of(inst):
+    base = rootfs(inst)
+    if os.path.exists(os.path.join(base, "usr/bin/apt")):
+        code, out = in_inst(inst, ["apt", "list", "--upgradable"], timeout=40)
+        pk = [l.split("/")[0] for l in out.splitlines() if "/" in l and "upgradable" in l]
+        sec = [l.split("/")[0] for l in out.splitlines() if "-security" in l]
+        stamp = os.path.join(base, "var/lib/apt/periodic/update-success-stamp")
+        return {"mgr": "apt", "n": len(pk), "security": sec, "pkgs": pk[:200],
+                "reboot": os.path.exists(os.path.join(base, "var/run/reboot-required")) or
+                          os.path.exists(os.path.join(base, "run/reboot-required")),
+                "refreshed": datetime.fromtimestamp(os.path.getmtime(stamp), timezone.utc).isoformat()
+                             if os.path.exists(stamp) else None}
+    if os.path.exists(os.path.join(base, "sbin/apk")):
+        code, out = in_inst(inst, ["apk", "list", "-u"], timeout=40)
+        pk = [l.split()[0] for l in out.splitlines() if "upgradable" in l]
+        return {"mgr": "apk", "n": len(pk), "security": [], "pkgs": pk[:200], "reboot": False, "refreshed": None}
+    return None
+
+
+def logins():
+    code, out = run(["journalctl", "--since", "-14d", "--no-pager", "-q", "-o", "short-iso",
+                     "-g", "Accepted (publickey|password)|session opened for user .*cockpit|pam_unix\\(cockpit:auth\\): authentication failure"],
+                    timeout=25)
+    rows = []
+    for l in out.splitlines():
+        t = l.split(" ", 1)[0]
+        m = re.search(r"Accepted (\w+) for (\S+) from (\S+)", l)
+        if m:
+            rows.append({"t": t, "kind": "SSH (%s)" % m.group(1), "user": m.group(2), "from": m.group(3), "ok": True})
+            continue
+        m = re.search(r"pam_unix\(cockpit:session\): session opened for user (\S+?)\(", l)
+        if m:
+            rows.append({"t": t, "kind": "Cockpit", "user": m.group(1), "from": "via proxy", "ok": True})
+            continue
+        m = re.search(r"cockpit:auth\): authentication failure.*?(?:rhost=(\S*))?.*?user=(\S+)", l)
+        if m:
+            rows.append({"t": t, "kind": "Cockpit", "user": m.group(2), "from": m.group(1) or "via proxy", "ok": False})
+    return rows[-60:][::-1]
+
+
+def geoblock():
+    code, out = run(["journalctl", "-k", "--since", "-24h", "--no-pager", "-q", "-g", "SSH-GEOBLOCK"], timeout=25)
+    ips = Counter(re.findall(r"SRC=(\S+)", out))
+    sets = {}
+    for name in IPSETS:
+        c, o = run(["ipset", "list", name, "-t"], timeout=5)
+        m = re.search(r"Number of entries: (\d+)", o)
+        sets[name] = int(m.group(1)) if m else None
+    return {"blocked_24h": sum(ips.values()), "distinct": len(ips),
+            "top": [{"ip": ip, "n": n} for ip, n in ips.most_common(10)], "ipsets": sets}
+
+
+def backups():
+    res = {"dirs": []}
+    for sub in ("sql", "www"):
+        d = os.path.join(BACKUP_DIR, sub)
+        if not os.path.isdir(d):
+            continue
+        files = [f for f in glob.glob(os.path.join(d, "*")) if os.path.isfile(f) and not f.endswith(".sha256")]
+        files.sort(key=os.path.getmtime)
+        res["dirs"].append({"name": sub, "count": len(files), "size": sum(os.path.getsize(f) for f in files),
+                            "last": [{"f": os.path.basename(f), "size": os.path.getsize(f),
+                                      "t": datetime.fromtimestamp(os.path.getmtime(f), timezone.utc).isoformat()}
+                                     for f in files[-4:]][::-1]})
+    code, out = run(["df", "-B1", "--output=size,used,avail,target", "/"], timeout=5)
+    p = out.splitlines()[-1].split() if out else []
+    if len(p) >= 3:
+        res["disk"] = {"size": int(p[0]), "used": int(p[1]), "avail": int(p[2])}
+    return res
+
+
+def cmd_system(args):
+    want = set(args) or {"ports", "updates", "logins", "geoblock", "backups"}
+    res = {}
+    insts = running_instances()
+    if "ports" in want:
+        res["ports"] = pmap(lambda i: {"instance": i, "ports": ports_of(i)}, insts)
+    if "updates" in want:
+        res["updates"] = pmap(lambda i: dict(instance=i, **(updates_of(i) or {"mgr": None, "n": 0})), insts)
+    if "logins" in want:
+        res["logins"] = logins()
+    if "geoblock" in want:
+        res["geoblock"] = geoblock()
+    if "backups" in want:
+        res["backups"] = backups()
+    return res
+
+
+COMMANDS = {"jails": cmd_jails, "history": cmd_history, "ip": cmd_ip, "tasks": cmd_tasks,
+            "certs": cmd_certs, "system": cmd_system,
+            "ban": lambda a: cmd_ban(a, False), "unban": lambda a: cmd_ban(a, True), "run": cmd_run}
+SYSTEM_PARTS = {"ports", "updates", "logins", "geoblock", "backups"}
+
+
+# Cache court des lectures : ouvrir/rechanger d'onglet ou le tableau de bord ne relance pas
+# des dizaines de lxc-attach. « --fresh » (bouton Actualiser) l'ignore ; ban/unban/run le vident.
+QUERY_TTL = {"jails": 20, "history": 30, "tasks": 30, "certs": 300, "system": 60}
+ACTIONS = {"ban", "unban", "run"}
+
+
+def _qcache_path(argv):
+    key = hashlib.sha1("\0".join(argv).encode()).hexdigest()[:20]
+    return os.path.join(UPD_CACHE, "q-%s.json" % key)
+
+
+def _qcache_clear():
+    for f in glob.glob(os.path.join(UPD_CACHE, "q-*.json")):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+def main():
+    fresh = len(sys.argv) > 1 and sys.argv[1] == "--fresh"
+    if fresh:
+        del sys.argv[1]
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        fail("sous-commande inconnue (attendu : %s)" % ", ".join(COMMANDS))
+    args = sys.argv[2:]
+    if sys.argv[1] == "system" and not set(args) <= SYSTEM_PARTS:
+        fail("partie inconnue")
+    if os.geteuid() != 0:
+        fail("l'assistant doit être lancé en root (via sudo)")
+    ttl = QUERY_TTL.get(sys.argv[1])
+    cf = _qcache_path(sys.argv[1:]) if ttl else None
+    if cf and not fresh:
+        try:
+            st = os.stat(cf)
+            if time.time() - st.st_mtime < ttl and st.st_uid == 0:
+                with open(cf, encoding="utf-8") as fh:
+                    sys.stdout.write(fh.read())
+                return
+        except OSError:
+            pass
+    try:
+        res = COMMANDS[sys.argv[1]](args)
+    except OSError as e:
+        fail("erreur : %s" % (e.strerror or e))
+    out = json.dumps(res, ensure_ascii=False, separators=(",", ":"))
+    if sys.argv[1] in ACTIONS:
+        _qcache_clear()
+    elif cf:
+        try:
+            os.makedirs(UPD_CACHE, mode=0o700, exist_ok=True)
+            tmp = cf + ".%d" % os.getpid()
+            with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as fh:
+                fh.write(out)
+            os.replace(tmp, cf)
+        except OSError:
+            pass
+    sys.stdout.write(out)
+
+
+if __name__ == "__main__":
+    main()

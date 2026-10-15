@@ -1,0 +1,18 @@
+{
+    "version": "1.0",
+    "requires": {
+        "cockpit": "270"
+    },
+    "conditions": [
+        { "path-exists": "/usr/bin/lxc-ls" }
+    ],
+    "menu": {
+        "index": {
+            "label": "Conteneurs LXC",
+            "order": 25,
+            "keywords": [
+                { "matches": ["lxc", "conteneur", "container", "nginx", "snapshot", "vm"], "weight": 3 }
+            ]
+        }
+    }
+}
